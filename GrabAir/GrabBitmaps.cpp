@@ -10,6 +10,14 @@
 //------------------------------------------------------------------------------
 #pragma comment(lib, "legacy_stdio_definitions.lib")
 #include "GrabBitmaps.h"
+#include "BlenderWrapper.h"
+#include <io.h>
+#include <sys/types.h>
+#include <sys/stat.h>  
+#include <fstream>
+#include <opencv2/opencv.hpp>
+
+using namespace cv;
 
 // Globals
 typedef struct _callbackinfo 
@@ -103,51 +111,7 @@ public:
         memcpy(cbInfo.pBuffer, pBuffer, lBufferSize);
 
         return 0;
-    }  
-
-	// This is the implementation function that writes the captured video
-	// data onto a bitmap on the user's disk.
-	//
-    int CopyBitmap(double SampleTime, BYTE * pBuffer, long BufferSize)
-    {
-        //
-        // Convert the buffer into a bitmap
-        //
-        TCHAR szFilename[MAX_PATH];
-        (void)StringCchPrintf(szFilename, NUMELMS(szFilename), TEXT("Bitmap%5.5d.bmp\0"), long( SampleTime * 1000 ) );
-
-        // Create a file to hold the bitmap
-        HANDLE hf = CreateFile(szFilename, GENERIC_WRITE, FILE_SHARE_READ, 
-                               NULL, CREATE_ALWAYS, NULL, NULL );
-
-        if( hf == INVALID_HANDLE_VALUE )
-        {
-            return 0;
-        }
-
-        // Write out the file header
-        //
-        BITMAPFILEHEADER bfh;
-        memset( &bfh, 0, sizeof( bfh ) );
-        bfh.bfType = 'MB';
-        bfh.bfSize = sizeof( bfh ) + BufferSize + sizeof( BITMAPINFOHEADER );
-        bfh.bfOffBits = sizeof( BITMAPINFOHEADER ) + sizeof( BITMAPFILEHEADER );
-
-        DWORD Written = 0;
-        WriteFile( hf, &bfh, sizeof( bfh ), &Written, NULL );
-   
-        Written = 0;
-        WriteFile( hf, &(cbInfo.bih), sizeof( cbInfo.bih ), &Written, NULL );
-
-        // Write the bitmap bits
-        //
-        Written = 0;
-        WriteFile( hf, pBuffer, BufferSize, &Written, NULL );
-
-        CloseHandle( hf );
-
-        return 0;
-    }
+    }   
 };
 
 // This semi-COM object will receive sample callbacks for us
@@ -166,7 +130,7 @@ CGrabBitmap::~CGrabBitmap()
 {
 }
 
-int CGrabBitmap::GrabBitmap(PBITMAPINFO *Bitmap, ULONG *BitmapSize)
+int CGrabBitmap::GrabBitmap()
 {
     USES_CONVERSION;
     CComPtr< ISampleGrabber > pGrabber;
@@ -175,7 +139,7 @@ int CGrabBitmap::GrabBitmap(PBITMAPINFO *Bitmap, ULONG *BitmapSize)
     CComPtr< IVideoWindow >   pVideoWindow;
     HRESULT hr;
 
-
+	ReadOffset();
     // Create the sample grabber
     //
     pGrabber.CoCreateInstance(CLSID_SampleGrabber);
@@ -211,7 +175,7 @@ int CGrabBitmap::GrabBitmap(PBITMAPINFO *Bitmap, ULONG *BitmapSize)
     //
     CMediaType GrabType;
     GrabType.SetType( &MEDIATYPE_Video );
-    GrabType.SetSubtype( &MEDIASUBTYPE_RGB24 );
+    GrabType.SetSubtype( &MEDIASUBTYPE_ARGB32 );
     hr = pGrabber->SetMediaType( &GrabType );
 
     // Get the output pin and the input pin
@@ -221,6 +185,41 @@ int CGrabBitmap::GrabBitmap(PBITMAPINFO *Bitmap, ULONG *BitmapSize)
 
     pSourcePin = GetOutPin( pSource, 0 );
     pGrabPin   = GetInPin( pGrabberBase, 0 );
+
+	// set output format
+	CComPtr<IAMStreamConfig> pCfg = 0;;
+	hr = pSourcePin->QueryInterface(IID_IAMStreamConfig, (void **)&pCfg);
+	int   iCount = 0, iSize = 0;
+	hr = pCfg->GetNumberOfCapabilities(&iCount, &iSize);
+	if (iSize == sizeof(VIDEO_STREAM_CONFIG_CAPS))
+	{
+		// Use the video capabilities structure.  
+		for (int iFormat = 0; iFormat < iCount; iFormat++)
+		{
+			VIDEO_STREAM_CONFIG_CAPS   scc;
+			VIDEOINFOHEADER*   pVih;
+			BITMAPINFOHEADER*   pBih = NULL;
+			AM_MEDIA_TYPE   *pmtConfig;
+			hr = pCfg->GetStreamCaps(iFormat, &pmtConfig, (BYTE*)&scc);
+			if (SUCCEEDED(hr))
+			{
+				/* Examine the format,and possibly use it. */
+				pVih = (VIDEOINFOHEADER*)pmtConfig->pbFormat;
+				pBih = &pVih->bmiHeader;
+				int width = pBih->biWidth;
+				int height = pBih->biHeight;
+				printf("Current Width: %d, Height: %d\n", width, height);
+				if (width == 3008 && height == 1504)
+				{
+					pVih->AvgTimePerFrame = 10000000 / 15;
+					hr = pCfg->SetFormat(pmtConfig);
+					FreeMediaType(*pmtConfig);
+					break;
+				}
+				FreeMediaType(*pmtConfig);
+			}
+		}
+	}
 
     // ... and connect them
     //
@@ -248,8 +247,9 @@ int CGrabBitmap::GrabBitmap(PBITMAPINFO *Bitmap, ULONG *BitmapSize)
     cbInfo.bih.biWidth = CB.Width;
     cbInfo.bih.biHeight = CB.Height;
     cbInfo.bih.biPlanes = 1;
-    cbInfo.bih.biBitCount = 24;
+    cbInfo.bih.biBitCount = 32;
 
+	printf("Width: %d, Height: %d\n", CB.Width, CB.Height);
     // Render the grabber output pin (to a video renderer)
     //
     CComPtr <IPin> pGrabOutPin = GetOutPin( pGrabberBase, 0 );
@@ -291,24 +291,103 @@ int CGrabBitmap::GrabBitmap(PBITMAPINFO *Bitmap, ULONG *BitmapSize)
 
     hr = pEvent->WaitForCompletion( INFINITE, &EvCode );
         
-    // callback got the sample
-    CHAR *BitmapData = NULL;
-	cbInfo.biSize = CalcBitmapInfoSize(cbInfo.bih);
-	ULONG Size = cbInfo.biSize + cbInfo.lBufferSize;
-	*BitmapSize = Size;
-
-	if(Bitmap)		// If we have a valid address from caller
+	if (cbInfo.pBuffer == nullptr || cbInfo.lBufferSize == 0)
 	{
-		*Bitmap = (BITMAPINFO *) new BYTE[Size];
-		if(*Bitmap)
-		{
-			(**Bitmap).bmiHeader = cbInfo.bih;
-			BitmapData = (CHAR *)(*Bitmap) + cbInfo.biSize;
-			memcpy(BitmapData, cbInfo.pBuffer, cbInfo.lBufferSize);
-		}
+		printf("Failed to read sample frame.\nMaybe the camera is busy right now...\n");
+		return cbInfo.lBufferSize;
 	}
+	CBlenderWrapper* m_blender = new CBlenderWrapper;
+	m_blender->capabilityAssessment();
+	m_blender->getSingleInstance(CBlenderWrapper::FOUR_CHANNELS);
+	m_blender->initializeDevice();
+
+	Mat outputBuffer(cbInfo.bih.biHeight, cbInfo.bih.biWidth, CV_8UC4);
+	Mat ResultImage(cbInfo.bih.biHeight, cbInfo.bih.biWidth, CV_8UC4);
+
+	BlenderParams params;
+	params.input_width = cbInfo.bih.biWidth;
+	params.input_height = cbInfo.bih.biHeight;
+	params.output_width = cbInfo.bih.biWidth;
+	params.output_height = cbInfo.bih.biHeight;
+	params.input_data = cbInfo.pBuffer;
+	params.output_data = ResultImage.data;
+	params.offset = mOffset; 
+
+	FlipImageVertically(cbInfo.pBuffer, params.input_width, params.input_height, 4);
+	m_blender->runImageBlender(params, CBlenderWrapper::PANORAMIC_BLENDER);
+	
+	imwrite("Insta360_Air.jpg", ResultImage);
 
     return cbInfo.lBufferSize;
+}
+
+/**
+* pixels_buffer - Pixels buffer to be operated
+* width - Image width
+* height - Image height
+* bytes_per_pixel - Number of image components, ie: 3 for rgb, 4 rgba, etc...
+**/
+void CGrabBitmap::FlipImageVertically(unsigned char *pixels, const size_t width, const size_t height, const size_t bytes_per_pixel)
+{
+	const size_t stride = width * bytes_per_pixel;
+	unsigned char *row = (unsigned char*)malloc(stride);
+	unsigned char *low = pixels;
+	unsigned char *high = &pixels[(height - 1) * stride];
+
+	for (; low < high; low += stride, high -= stride) {
+		memcpy(row, low, stride);
+		memcpy(low, high, stride);
+		memcpy(high, row, stride);
+	}
+	free(row);
+}
+
+void CGrabBitmap::RGB2RGBA(unsigned char* rgba, unsigned char* rgb, int imageSize)
+{
+	if (rgba == nullptr || rgb == nullptr || imageSize <= 0)
+	{
+		return;
+	}
+	int rgbIndex = 0;
+	int rgbaIndex = 0;
+
+	while (rgbIndex < imageSize) {
+		rgba[rgbaIndex] = rgb[rgbIndex];
+		rgba[rgbaIndex + 1] = rgb[rgbIndex + 1];
+		rgba[rgbaIndex + 2] = rgb[rgbIndex + 2];
+		rgba[rgbaIndex + 3] = 255;
+		rgbIndex += 3;
+		rgbaIndex += 4;
+	}
+}
+
+void CGrabBitmap::ReadOffset()
+{
+	char buffer[128] = { '\0' };
+	char* home = getenv("HOMEDRIVE");
+	if (home != NULL)
+	{
+		std::string fullPath = std::string(home);
+		home = getenv("HOMEPATH");
+		if (home != NULL)
+		{
+			fullPath = fullPath + home;
+			fullPath = fullPath + "\\AppData\\Local\\insta360\\USBCamera\\uvcoffset";   
+
+			std::ifstream offset(fullPath);
+			if (!offset)
+			{
+				printf("Can't open offset file, use default offset instead.\n");
+				// set default offset
+				mOffset = "2_740.004_753.000_728.820_0.000_0.000_90.000_737.249_2253.118_756.878_0.220_-0.700_89.940_3008_1504_1034";
+			}
+			else
+			{
+				offset >> mOffset;
+				printf("Read offset: %s\n", mOffset.c_str());
+			}
+		}
+	}
 }
 
 
@@ -405,15 +484,4 @@ void CGrabBitmap::GetDefaultCapDevice(IBaseFilter **ppCap)
 			break;
 	}
 	return;
-} 
-
-void CGrabBitmap::SaveData()
-{
-	CB.CopyBitmap(cbInfo.dblSampleTime, cbInfo.pBuffer, cbInfo.lBufferSize);
-}
-
-ULONG CGrabBitmap::CalcBitmapInfoSize(const BITMAPINFOHEADER &bmiHeader)
-{
-	UINT bmiSize = (bmiHeader.biSize != 0) ? bmiHeader.biSize : sizeof(BITMAPINFOHEADER);
-	return bmiSize + bmiHeader.biClrUsed * sizeof(RGBQUAD);
-}
+}  
